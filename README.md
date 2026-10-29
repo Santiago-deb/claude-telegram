@@ -13,14 +13,15 @@ Un bot **privado** de Telegram conectado a una sesión de [Claude Code](https://
 | Escribir cualquier cosa | Va a Claude Code. Mientras trabaja ves "escribiendo…" y un mensaje que muestra la herramienta que está usando. |
 | Mandar una **foto** | Se guarda en la PC y Claude la ve. |
 | Mandar un **archivo** | Se guarda en `~/Downloads/telegram` y Claude recibe la ruta. |
-| Mandar una **nota de voz** | Se pasa a texto (faster-whisper, si está instalado) y te muestra lo que entendió. |
+| Mandar una **nota de voz** | Se pasa a texto (faster-whisper, si está instalado) y se la paso a Claude; con `/transcripcion on` también te muestra lo que entendió. |
 | "Mandame el pdf de…" | Claude te lo manda con `claude-telegram enviar`. Las carpetas van en zip (hasta 50 MB). |
 | `/nombre-de-skill …` | Los skills y comandos de Claude Code andan igual que en la terminal. `/skills` los lista. |
-| `/tts on` · `off` · `voces` · `-r` · `-stop` | Respuestas también en nota de voz, elegir voz, repetir el último audio, no mandar el de la respuesta en curso. |
+| `/tts on` · `off` · `voces` · `-r` · `-t` · `-stop` | Respuestas solo en nota de voz, elegir voz, repetir el último audio, mandar el texto de la última respuesta, no mandar el audio de la respuesta en curso (va en texto). |
 | `/parar` | Corta lo que Claude está haciendo. |
 | `/nueva` · `/retomar` · `/terminar` | Conversación nueva, volver a la anterior, cerrarla ya. |
 | `/archivo RUTA` | Te manda ese archivo sin pasar por Claude. |
 | `/detalle on/off` | Ver cada herramienta que usa Claude como mensaje aparte. |
+| `/transcripcion on/off` | Texto junto a los audios: lo que entendió de cada nota de voz y, con `/tts on`, el texto de cada respuesta (apagado de entrada; Claude recibe igual tus audios). |
 | `/estado` · `/ayuda` · `/apagar` | Estado, ayuda, apagar el bot (se vuelve a prender desde la PC). |
 
 ### Conversaciones que se apagan solas

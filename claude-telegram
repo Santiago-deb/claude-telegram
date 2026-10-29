@@ -61,10 +61,11 @@ COMANDOS = [
     ("nueva", "Conversación nueva (cierra la actual)"),
     ("retomar", "Vuelve a la última conversación"),
     ("terminar", "Termina la conversación ahora"),
-    ("tts", "Respuestas en audio: on | off | voces | -r | -stop"),
+    ("tts", "Respuestas en audio: on | off | voces | -r | -t | -stop"),
     ("skills", "Lista los skills y comandos de Claude"),
     ("archivo", "Te mando un archivo de la PC: /archivo RUTA"),
     ("detalle", "Ver cada herramienta que usa Claude: on | off"),
+    ("transcripcion", "Texto junto a los audios (tuyos y míos): on | off"),
     ("apagar", "Apaga el bot hasta prenderlo desde la PC"),
 ]
 
@@ -371,7 +372,7 @@ class BotClaude:
         self.cfg = cfg
         self.t = Bot(cfg["token"])
         self.chat = cfg["dueno"]
-        self.estado = {"tts": False, "detalle": False, "ultima_sesion": None}
+        self.estado = {"tts": False, "detalle": False, "transcripcion": False, "ultima_sesion": None}
         if ESTADO.exists():
             self.estado.update(json.loads(ESTADO.read_text()))
         self.sesion = Sesion(self)
@@ -381,6 +382,7 @@ class BotClaude:
         self.estado_msg = None          # mensaje "trabajando…" que se va editando
         self.estado_t = 0
         self.ultimo_audio = None
+        self.ultimo_texto = None
         self.gen_audio = 0
         self.cortado = False            # tras /parar no muestro el error de "interrumpido"
         self.lock_envio = threading.Lock()
@@ -426,9 +428,14 @@ class BotClaude:
         except Exception:  # noqa: BLE001
             pass
 
+    def solo_voz(self):
+        """Con /tts on la respuesta va solo en audio; el texto, con /tts -t o /transcripcion on."""
+        return self.estado["tts"] and self.cfg["tts_comando"] and not self.estado["transcripcion"]
+
     def decir(self, md):
         self._sacar_estado()
-        self.texto(md)
+        if not self.solo_voz():
+            self.texto(md)
 
     def herramienta(self, nombre, entrada):
         resumen = entrada.get("command") or entrada.get("file_path") or entrada.get("pattern") or \
@@ -460,9 +467,11 @@ class BotClaude:
         if error and not self.cortado:
             self.texto(f"⚠️ {error}", plano=True)
         self.cortado = False
+        if texto:
+            self.ultimo_texto = texto
         if texto and self.estado["tts"] and self.cfg["tts_comando"]:
             gen = self.gen_audio
-            threading.Thread(target=self._audio, args=(texto, gen), daemon=True).start()
+            threading.Thread(target=self._audio, args=(texto, gen, self.solo_voz()), daemon=True).start()
 
     def sesion_caida(self, codigo):
         self._sacar_estado()
@@ -470,7 +479,7 @@ class BotClaude:
                    "o /retomar para seguir la anterior.")
 
     # -- audio (/tts)
-    def _audio(self, texto, gen):
+    def _audio(self, texto, gen, oculto=False):
         with tempfile.TemporaryDirectory() as tmp:
             wav, ogg = Path(tmp) / "r.wav", Path(tmp) / "r.ogg"
             cmd = [a.replace("{salida}", str(wav)) for a in self.cfg["tts_comando"]]
@@ -482,10 +491,14 @@ class BotClaude:
                                 str(ogg)], timeout=120, check=True)
             except Exception as e:  # noqa: BLE001
                 log("tts:", e)
-                self.texto("⚠️ No pude generar el audio de esa respuesta.")
+                self.texto("⚠️ No pude generar el audio de esa respuesta." + (" Va en texto:" if oculto else ""))
+                if oculto:
+                    self.texto(texto)
                 return
-            if gen != self.gen_audio:
-                return  # -stop
+            if gen != self.gen_audio:  # -stop / off: si el texto no salió, que salga
+                if oculto:
+                    self.texto(texto)
+                return
             self.ultimo_audio = ogg.read_bytes()
         self._mandar_audio()
 
@@ -514,7 +527,8 @@ class BotClaude:
             self.guardar_estado()
             if self.cfg["tts_prender"]:
                 subprocess.Popen(self.cfg["tts_prender"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            return self.texto("🔊 Voz prendida: cada respuesta te llega también en audio.")
+            return self.texto("🔊 Voz prendida: las respuestas te llegan solo en audio. `/tts -t` te manda el texto de la última; "
+                              "`/transcripcion on` para recibir siempre audio y texto.")
         if a == "off":
             self.estado["tts"] = False
             self.guardar_estado()
@@ -527,6 +541,8 @@ class BotClaude:
         if a == "-stop":
             self.gen_audio += 1
             return self.texto("⏹ Corto el audio de esta respuesta.")
+        if a == "-t":
+            return self.texto(self.ultimo_texto) if self.ultimo_texto else self.texto("Todavía no te contesté nada.")
         if a == "voces":
             lista = self.voces()
             if not lista:
@@ -538,7 +554,7 @@ class BotClaude:
         if a in ("-h", "ayuda"):
             return self.texto(AYUDA_TTS)
         prendida = "prendida 🔊" if self.estado["tts"] else "apagada 🔇"
-        self.texto(f"La voz está {prendida}. `/tts on`, `/tts off`, `/tts voces`, `/tts -r` (repetir), `/tts -stop`.")
+        self.texto(f"La voz está {prendida}. `/tts on`, `/tts off`, `/tts voces`, `/tts -r` (repetir), `/tts -t` (texto), `/tts -stop`.")
 
     def elegir_voz(self, voz):
         if not self.cfg["tts_elegir"]:
@@ -613,7 +629,8 @@ class BotClaude:
             dicho = self.transcribir(destino)
             if dicho:
                 destino.unlink(missing_ok=True)
-                self.texto(f"🎤 _{dicho}_")
+                if self.estado["transcripcion"]:
+                    self.texto(f"🎤 _{dicho}_")
                 return f"{texto}\n{dicho}".strip()
             return f"{texto}\n\n(Te mandé un audio, quedó en {destino}; no lo pude pasar a texto.)".strip()
         for clave in ("document", "video", "animation"):
@@ -649,6 +666,7 @@ class BotClaude:
             self.texto(f"**Conversación:** {sesion}\n**Sin charla hace:** {quieto} min "
                        f"(pregunto a los {self.cfg['inactividad_min']})\n"
                        f"**Voz:** {'on' if self.estado['tts'] else 'off'}\n**Detalle:** {'on' if self.estado['detalle'] else 'off'}\n"
+                       f"**Transcripción:** {'on' if self.estado['transcripcion'] else 'off'}\n"
                        f"**Carpeta:** `{ruta(self.cfg['carpeta'])}`")
         elif cmd == "parar":
             self.texto("⏹ Corto." if self.sesion.interrumpir() else "No hay nada andando.")
@@ -672,6 +690,12 @@ class BotClaude:
             self.estado["detalle"] = (args[:1] or ["on"])[0].lower() != "off"
             self.guardar_estado()
             self.texto("Te muestro cada herramienta que usa." if self.estado["detalle"] else "Solo te muestro las respuestas.")
+        elif cmd == "transcripcion":
+            self.estado["transcripcion"] = (args[:1] or ["on"])[0].lower() != "off"
+            self.guardar_estado()
+            self.texto("Te muestro lo que entendí de cada audio y, con /tts on, el texto de mis respuestas."
+                       if self.estado["transcripcion"] else
+                       "Sin transcripciones: ni de tus audios (se los paso igual a Claude) ni de mis respuestas en audio.")
         elif cmd == "skills":
             if not self.skills:
                 self.texto("Todavía no sé cuáles hay: mandame cualquier cosa para arrancar la sesión y volvé a pedirlo.")
@@ -823,11 +847,12 @@ Escribime como en la terminal: tengo acceso a tu PC.
 • Si no hablamos por 25 min te pregunto si sigo; sin respuesta en 3 min cierro la conversación. Tu próximo mensaje arranca otra.
 
 /parar · /nueva · /retomar · /terminar · /estado
-/tts on | off | voces | -r | -stop · /detalle on | off · /apagar"""
+/tts on | off | voces | -r | -t | -stop · /detalle on | off · /transcripcion on | off · /apagar"""
 
 AYUDA_TTS = """**Voz** 🔊
-`/tts on`: cada respuesta te llega también como nota de voz
+`/tts on`: cada respuesta te llega solo como nota de voz
 `/tts off`: solo texto
+`/tts -t`: el texto de la última respuesta
 `/tts voces`: elegir la voz
 `/tts -r`: repetir el último audio
 `/tts -stop`: no mandar el audio de la respuesta en curso"""
