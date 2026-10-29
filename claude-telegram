@@ -916,7 +916,7 @@ def configurar():
     if input("\n¿Prendo el bot ahora y en cada inicio de sesión? [S/n] ").strip().lower() in ("", "s", "si", "sí", "y"):
         systemctl("enable", "--now", SERVICIO)
         print("🟢 Bot prendido. Escribile desde Telegram.")
-    print("\nPara root (botón de autorización): sudo ./instalar-root.sh  (ver README)")
+    print(f"\nPara root (botón de autorización): sudo {AQUI / 'instalar-root.sh'}  (ver README)")
 
 
 def main():
