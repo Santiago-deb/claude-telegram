@@ -1,0 +1,974 @@
+#!/usr/bin/env python3
+"""Claude Code desde Telegram: un bot privado que conversa con una sesión de Claude Code en tu PC.
+
+  claude-telegram configurar      asistente: token del bot, vincular tu cuenta y prender el servicio
+  claude-telegram vincular        solo el último paso: vincular tu cuenta de Telegram (código o QR)
+  claude-telegram enviar RUTA...  manda archivos o carpetas a tu Telegram  [-m "texto"]
+  claude-telegram on | off        prende / apaga el bot (servicio de usuario claude-telegram)
+  claude-telegram estado
+  claude-telegram servir          el bot en sí (lo arranca claude-telegram.service)
+
+Solo le contesta a la cuenta vinculada. Sin dependencias: Python 3.11+ (biblioteca estándar).
+"""
+import base64
+import html
+import json
+import mimetypes
+import os
+import random
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.request
+import uuid
+import zipfile
+from pathlib import Path
+
+AQUI = Path(__file__).resolve().parent
+CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "claude-telegram" / "config.json"
+ESTADO = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "claude-telegram" / "estado.json"
+PAUSA = Path(os.environ.get("CLAUDE_TELEGRAM_PAUSA", "/run/claude-telegram/pausa"))  # la crea tg-root (root) mientras espera tu botón
+SERVICIO = "claude-telegram"
+API = os.environ.get("CLAUDE_TELEGRAM_API", "https://api.telegram.org")  # para probar con un servidor falso
+
+DEFECTO = {
+    "token": "",
+    "dueno": 0,                      # id de tu cuenta de Telegram (lo llena `vincular`)
+    "nombre": "",
+    "modelo": "",                    # vacío = el de Claude Code por defecto
+    "carpeta": "~",                  # dónde trabaja Claude
+    "recibidos": "~/Downloads/telegram",
+    "inactividad_min": 25,           # sin charla por tanto tiempo -> pregunta si sigue
+    "confirmar_min": 3,              # sin "seguir" en ese plazo -> termina la conversación
+    "permisos": "bypassPermissions",  # acceso completo, como pediste; "acceptEdits"/"default" para más cuidado
+    "tts_comando": [],               # lee texto por stdin y deja un wav en {salida}; ej. ["tts-claude", "archivo", "{salida}"]
+    "tts_voces": [],                 # lista "nombre<TAB>descripción"; ej. ["tts-claude", "voces"]
+    "tts_elegir": [],                # cambia la voz; ej. ["tts-claude", "voz", "{voz}"]
+    "tts_prender": [],               # al prender /tts; ej. ["tts-claude", "on", "telegram"]
+    "tts_apagar": [],                # al apagar /tts; ej. ["tts-claude", "off", "telegram"]
+    "transcribir": [],               # notas de voz -> texto; imprime el texto. ej. ["python3", "transcribir.py", "{entrada}"]
+}
+
+COMANDOS = [
+    ("ayuda", "Qué puedo hacer y cómo"),
+    ("estado", "Sesión, voz y tiempo sin charla"),
+    ("parar", "Corta lo que Claude está haciendo"),
+    ("nueva", "Conversación nueva (cierra la actual)"),
+    ("retomar", "Vuelve a la última conversación"),
+    ("terminar", "Termina la conversación ahora"),
+    ("tts", "Respuestas en audio: on | off | voces | -r | -stop"),
+    ("skills", "Lista los skills y comandos de Claude"),
+    ("archivo", "Te mando un archivo de la PC: /archivo RUTA"),
+    ("detalle", "Ver cada herramienta que usa Claude: on | off"),
+    ("apagar", "Apaga el bot hasta prenderlo desde la PC"),
+]
+
+
+def log(*a):
+    print(*a, flush=True)
+
+
+def cargar_config():
+    cfg = dict(DEFECTO)
+    if CONFIG.exists():
+        cfg.update(json.loads(CONFIG.read_text()))
+    return cfg
+
+
+def guardar_config(cfg):
+    CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    tmp = CONFIG.with_suffix(".tmp")
+    tmp.write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n")
+    os.chmod(tmp, 0o600)  # tiene el token del bot
+    tmp.replace(CONFIG)
+
+
+def ruta(p):
+    return Path(os.path.expanduser(p))
+
+
+# --- Bot API ----------------------------------------------------------------
+
+class ErrorTelegram(Exception):
+    def __init__(self, codigo, descripcion):
+        super().__init__(f"{codigo}: {descripcion}")
+        self.codigo = codigo
+
+
+class Bot:
+    def __init__(self, token):
+        self.token = token
+        self.base = f"{API}/bot{token}/"
+
+    def api(self, metodo, espera=30, archivos=None, **params):
+        params = {k: v for k, v in params.items() if v is not None}
+        if archivos:
+            limite = "----ct" + uuid.uuid4().hex
+            cuerpo = bytearray()
+            for k, v in params.items():
+                v = json.dumps(v) if isinstance(v, (dict, list)) else str(v)
+                cuerpo += f'--{limite}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode()
+            for campo, (nombre, datos) in archivos.items():
+                nombre = nombre.replace('"', "")
+                tipo = mimetypes.guess_type(nombre)[0] or "application/octet-stream"
+                cuerpo += (f'--{limite}\r\nContent-Disposition: form-data; name="{campo}"; filename="{nombre}"\r\n'
+                           f"Content-Type: {tipo}\r\n\r\n").encode() + datos + b"\r\n"
+            cuerpo += f"--{limite}--\r\n".encode()
+            req = urllib.request.Request(self.base + metodo, data=bytes(cuerpo),
+                                         headers={"Content-Type": f"multipart/form-data; boundary={limite}"})
+        else:
+            req = urllib.request.Request(self.base + metodo, data=json.dumps(params).encode(),
+                                         headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=espera) as r:
+                res = json.load(r)
+        except urllib.error.HTTPError as e:
+            try:
+                res = json.load(e)
+            except Exception:  # noqa: BLE001
+                raise ErrorTelegram(e.code, e.reason) from None
+        if not res.get("ok"):
+            raise ErrorTelegram(res.get("error_code"), res.get("description"))
+        return res["result"]
+
+    def bajar(self, file_id):
+        info = self.api("getFile", file_id=file_id)
+        url = f"{API}/file/bot{self.token}/{info['file_path']}"
+        with urllib.request.urlopen(url, timeout=120) as r:
+            return info["file_path"], r.read()
+
+
+# --- markdown de Claude -> HTML de Telegram ----------------------------------
+
+def _en_linea(t):
+    partes = re.split(r"(`[^`\n]+`)", t)
+    salida = []
+    for p in partes:
+        if len(p) > 1 and p.startswith("`") and p.endswith("`"):
+            salida.append(f"<code>{html.escape(p[1:-1])}</code>")
+            continue
+        p = html.escape(p, quote=False)
+        p = re.sub(r"\[([^\]\n]+)\]\((https?://[^)\s]+)\)", lambda m: f'<a href="{m[2]}">{m[1]}</a>', p)
+        p = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", p)
+        p = re.sub(r"(?<![\w*])\*(?!\s)([^*\n]+?)(?<!\s)\*(?![\w*])", r"<i>\1</i>", p)
+        p = re.sub(r"~~(.+?)~~", r"<s>\1</s>", p)
+        salida.append(p)
+    return "".join(salida)
+
+
+def md_a_html(md):
+    lineas, salida, i = md.split("\n"), [], 0
+    while i < len(lineas):
+        ln = lineas[i]
+        m = re.match(r"\s*```\s*([\w+-]*)", ln)
+        if m:
+            codigo, i = [], i + 1
+            while i < len(lineas) and not lineas[i].strip().startswith("```"):
+                codigo.append(lineas[i])
+                i += 1
+            clase = f' class="language-{m[1]}"' if m[1] else ""
+            salida.append(f"<pre><code{clase}>{html.escape(chr(10).join(codigo))}</code></pre>")
+            i += 1
+            continue
+        if ln.strip().startswith("|"):  # tablas: monoespaciado para que no se desarmen
+            tabla = []
+            while i < len(lineas) and lineas[i].strip().startswith("|"):
+                if not re.fullmatch(r"\s*\|[\s|:-]+\|\s*", lineas[i]):
+                    tabla.append(lineas[i].strip())
+                i += 1
+            salida.append(f"<pre>{html.escape(chr(10).join(tabla))}</pre>")
+            continue
+        h = re.match(r"\s*#{1,6}\s+(.*)", ln)
+        if h:
+            salida.append(f"<b>{_en_linea(h[1])}</b>")
+        else:
+            ln = re.sub(r"^(\s*)[-*]\s+", r"\1• ", ln)
+            salida.append(_en_linea(ln))
+        i += 1
+    return "\n".join(salida)
+
+
+def partir(md, limite=3500):
+    """Corta en trozos que entren en un mensaje sin romper bloques de código."""
+    trozos, actual, en_codigo, cerca = [], [], False, ""
+    for ln in md.split("\n"):
+        while len(ln) > limite:
+            trozos.append(ln[:limite])
+            ln = ln[limite:]
+        if sum(len(x) + 1 for x in actual) + len(ln) > limite and actual:
+            if en_codigo:
+                actual.append("```")
+            trozos.append("\n".join(actual))
+            actual = [cerca] if en_codigo else []
+        if ln.strip().startswith("```"):
+            en_codigo = not en_codigo
+            cerca = ln.strip()
+        actual.append(ln)
+    if any(x.strip() for x in actual):
+        trozos.append("\n".join(actual))
+    return [t for t in trozos if t.strip()]
+
+
+# --- mandar archivos ---------------------------------------------------------
+
+LIMITE = 49 * 1024 * 1024
+
+
+def mandar_archivo(bot, chat, p, texto=None):
+    p = ruta(p)
+    if not p.exists():
+        raise FileNotFoundError(f"no existe {p}")
+    if p.is_dir():
+        with tempfile.TemporaryDirectory() as tmp:
+            zipeado = Path(tmp) / f"{p.name or 'carpeta'}.zip"
+            with zipfile.ZipFile(zipeado, "w", zipfile.ZIP_DEFLATED) as z:
+                for f in p.rglob("*"):
+                    if f.is_file():
+                        z.write(f, f.relative_to(p.parent))
+            return mandar_archivo(bot, chat, zipeado, texto)
+    if p.stat().st_size > LIMITE:
+        raise ValueError(f"{p.name} pesa {p.stat().st_size // 2**20} MB; Telegram deja mandar hasta 50 MB")
+    datos, ext = p.read_bytes(), p.suffix.lower()
+    if ext in (".jpg", ".jpeg", ".png", ".webp") and len(datos) < 10 * 2**20:
+        metodo, campo = "sendPhoto", "photo"
+    elif ext in (".mp4", ".mov", ".webm"):
+        metodo, campo = "sendVideo", "video"
+    elif ext in (".mp3", ".m4a", ".flac", ".wav"):
+        metodo, campo = "sendAudio", "audio"
+    else:
+        metodo, campo = "sendDocument", "document"
+    try:
+        return bot.api(metodo, espera=300, archivos={campo: (p.name, datos)}, chat_id=chat, caption=texto)
+    except ErrorTelegram:
+        if metodo == "sendDocument":
+            raise
+        return bot.api("sendDocument", espera=300, archivos={"document": (p.name, datos)}, chat_id=chat, caption=texto)
+
+
+# --- la sesión de Claude ------------------------------------------------------
+
+def prompt_sistema(cfg):
+    nombre = cfg.get("nombre") or "el usuario"
+    recibidos = ruta(cfg["recibidos"])
+    return f"""Estás hablando con {nombre} por Telegram, desde su celular, a través de claude-telegram (un puente a esta sesión de Claude Code en su PC). Tenés el mismo acceso a la PC que en una sesión normal de Claude Code.
+
+- Respondé en el idioma en que te escribe, corto y claro: se lee en un celular. Evitá tablas anchas.
+- {nombre} no ve la pantalla de la PC ni la terminal. Si te pide ver algo, sacá una captura (por ejemplo `grim /tmp/captura.png`) y mandásela.
+- Para mandarle archivos o carpetas de la PC: `claude-telegram enviar RUTA [RUTA...] [-m "texto"]` (hasta 50 MB; las carpetas van en zip).
+- Lo que te manda (fotos, archivos, audios) queda guardado en {recibidos} y te llega la ruta.
+- No tenés la contraseña de sudo ni una terminal interactiva: `sudo` directo falla. Para lo que necesite root usá `tg-sudo 'comando'`: a {nombre} le llega un botón en Telegram para autorizarlo. Si lo rechaza o no contesta en 5 minutos, el comando falla con código 126; no lo vuelvas a intentar sin preguntarle.
+- Los comandos que empiezan con / y no son del bot te llegan tal cual (skills y comandos de Claude Code)."""
+
+
+class Sesion:
+    """Un `claude -p` en modo stream-json que vive mientras dure la conversación."""
+
+    def __init__(self, bot):
+        self.b = bot
+        self.proc = None
+        self.id = None
+        self.ocupado = False
+        self.lock = threading.Lock()
+
+    def viva(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def arrancar(self, retomar=None):
+        cfg = self.b.cfg
+        cmd = ["claude", "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
+               "--permission-mode", cfg["permisos"], "--append-system-prompt", prompt_sistema(cfg)]
+        if cfg.get("modelo"):
+            cmd += ["--model", cfg["modelo"]]
+        if retomar:
+            cmd += ["--resume", retomar]
+        env = {**os.environ, "CLAUDE_TELEGRAM": "1"}
+        env["PATH"] = f"{AQUI}:{AQUI / 'bin'}:{Path.home() / '.local/bin'}:{env.get('PATH', '/usr/bin:/bin')}"
+        log("arrancando claude", "(retomando)" if retomar else "")
+        self.proc = subprocess.Popen(cmd, cwd=ruta(cfg["carpeta"]), env=env, stdin=subprocess.PIPE,
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+        self.id = retomar
+        threading.Thread(target=self._leer, args=(self.proc,), daemon=True).start()
+        threading.Thread(target=self._errores, args=(self.proc,), daemon=True).start()
+
+    def mandar(self, contenido):
+        with self.lock:
+            if not self.viva():
+                self.arrancar()
+            self.ocupado = True
+            msg = {"type": "user", "message": {"role": "user", "content": contenido}}
+            self.proc.stdin.write(json.dumps(msg) + "\n")
+            self.proc.stdin.flush()
+
+    def interrumpir(self):
+        if not self.viva():
+            return False
+        self.b.cortado = True
+        pedido = {"type": "control_request", "request_id": uuid.uuid4().hex, "request": {"subtype": "interrupt"}}
+        with self.lock:
+            self.proc.stdin.write(json.dumps(pedido) + "\n")
+            self.proc.stdin.flush()
+        return True
+
+    def cerrar(self):
+        p, self.proc = self.proc, None
+        self.ocupado = False
+        if p and p.poll() is None:
+            try:
+                p.stdin.close()
+                p.wait(5)
+            except Exception:  # noqa: BLE001
+                p.terminate()
+                try:
+                    p.wait(5)
+                except subprocess.TimeoutExpired:
+                    p.kill()
+
+    def _errores(self, proc):
+        for linea in proc.stderr:
+            log("claude:", linea.rstrip()[:300])
+
+    def _leer(self, proc):
+        textos = []
+        for linea in proc.stdout:
+            try:
+                ev = json.loads(linea)
+            except json.JSONDecodeError:
+                continue
+            tipo = ev.get("type")
+            if tipo == "system" and ev.get("subtype") == "init":
+                self.id = ev.get("session_id") or self.id
+                self.b.skills = ev.get("slash_commands") or self.b.skills
+                if self.id:
+                    self.b.estado["ultima_sesion"] = self.id
+                    self.b.guardar_estado()
+            elif tipo == "assistant":
+                for bloque in ev.get("message", {}).get("content", []):
+                    if bloque.get("type") == "text" and bloque.get("text", "").strip():
+                        textos.append(bloque["text"])
+                        self.b.decir(bloque["text"])
+                    elif bloque.get("type") == "tool_use":
+                        self.b.herramienta(bloque.get("name", "?"), bloque.get("input", {}))
+            elif tipo == "result":
+                self.ocupado = False
+                error = ev.get("subtype") not in (None, "success") or ev.get("is_error")
+                self.b.fin_de_turno("\n\n".join(textos), error and (ev.get("result") or ev.get("subtype")))
+                textos = []
+        if self.proc is proc:  # se murió sola, no la cerramos nosotros
+            self.proc, self.ocupado = None, False
+            self.b.sesion_caida(proc.wait())
+        log("claude terminó")
+
+
+# --- el bot -------------------------------------------------------------------
+
+class BotClaude:
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.t = Bot(cfg["token"])
+        self.chat = cfg["dueno"]
+        self.estado = {"tts": False, "detalle": False, "ultima_sesion": None}
+        if ESTADO.exists():
+            self.estado.update(json.loads(ESTADO.read_text()))
+        self.sesion = Sesion(self)
+        self.skills = []
+        self.ultimo = time.time()       # última charla (mensaje tuyo o fin de respuesta)
+        self.pregunta = None            # (message_id, cuándo) del "¿seguimos?"
+        self.estado_msg = None          # mensaje "trabajando…" que se va editando
+        self.estado_t = 0
+        self.ultimo_audio = None
+        self.gen_audio = 0
+        self.cortado = False            # tras /parar no muestro el error de "interrumpido"
+        self.lock_envio = threading.Lock()
+
+    def guardar_estado(self):
+        ESTADO.parent.mkdir(parents=True, exist_ok=True)
+        ESTADO.write_text(json.dumps(self.estado))
+
+    # -- salida
+    def texto(self, md, botones=None, plano=False):
+        ultimo = None
+        trozos = partir(md) or ["…"]
+        for n, trozo in enumerate(trozos):
+            teclado = {"inline_keyboard": botones} if botones and n == len(trozos) - 1 else None
+            with self.lock_envio:
+                try:
+                    if plano:
+                        raise ErrorTelegram(0, "plano")
+                    ultimo = self.t.api("sendMessage", chat_id=self.chat, text=md_a_html(trozo), parse_mode="HTML",
+                                        link_preview_options={"is_disabled": True}, reply_markup=teclado)
+                except ErrorTelegram as e:
+                    if e.codigo not in (0, 400):
+                        log("no pude mandar:", e)
+                        continue
+                    try:
+                        ultimo = self.t.api("sendMessage", chat_id=self.chat, text=trozo, reply_markup=teclado)
+                    except Exception as e2:  # noqa: BLE001
+                        log("no pude mandar:", e2)
+                except Exception as e:  # noqa: BLE001
+                    log("no pude mandar:", e)
+        return ultimo
+
+    def editar(self, msg_id, md, botones=None):
+        try:
+            self.t.api("editMessageText", chat_id=self.chat, message_id=msg_id, text=md_a_html(md), parse_mode="HTML",
+                       reply_markup={"inline_keyboard": botones or []})
+        except Exception as e:  # noqa: BLE001
+            log("no pude editar:", e)
+
+    def borrar(self, msg_id):
+        try:
+            self.t.api("deleteMessage", chat_id=self.chat, message_id=msg_id)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def decir(self, md):
+        self._sacar_estado()
+        self.texto(md)
+
+    def herramienta(self, nombre, entrada):
+        resumen = entrada.get("command") or entrada.get("file_path") or entrada.get("pattern") or \
+            entrada.get("url") or entrada.get("description") or entrada.get("skill") or ""
+        resumen = str(resumen).replace("\n", " ")
+        resumen = resumen[:120] + ("…" if len(resumen) > 120 else "")
+        linea = f"🔧 {nombre}" + (f": `{resumen}`" if resumen else "")
+        if self.estado["detalle"]:
+            self.texto(linea)
+            return
+        ahora = time.time()
+        if self.estado_msg and ahora - self.estado_t < 2:
+            return
+        self.estado_t = ahora
+        if self.estado_msg:
+            self.editar(self.estado_msg, "⏳ Trabajando…\n" + linea)
+        else:
+            m = self.texto("⏳ Trabajando…\n" + linea)
+            self.estado_msg = m and m["message_id"]
+
+    def _sacar_estado(self):
+        if self.estado_msg:
+            self.borrar(self.estado_msg)
+            self.estado_msg = None
+
+    def fin_de_turno(self, texto, error):
+        self._sacar_estado()
+        self.ultimo = time.time()
+        if error and not self.cortado:
+            self.texto(f"⚠️ {error}", plano=True)
+        self.cortado = False
+        if texto and self.estado["tts"] and self.cfg["tts_comando"]:
+            gen = self.gen_audio
+            threading.Thread(target=self._audio, args=(texto, gen), daemon=True).start()
+
+    def sesion_caida(self, codigo):
+        self._sacar_estado()
+        self.texto(f"⚠️ La sesión de Claude se cerró sola (código {codigo}). Escribime para arrancar otra, "
+                   "o /retomar para seguir la anterior.")
+
+    # -- audio (/tts)
+    def _audio(self, texto, gen):
+        with tempfile.TemporaryDirectory() as tmp:
+            wav, ogg = Path(tmp) / "r.wav", Path(tmp) / "r.ogg"
+            cmd = [a.replace("{salida}", str(wav)) for a in self.cfg["tts_comando"]]
+            try:
+                if self.cfg["tts_prender"]:  # que el servicio de voz sepa que lo usamos (si no, queda prendido de más)
+                    subprocess.run(self.cfg["tts_prender"], timeout=60, capture_output=True)
+                subprocess.run(cmd, input=texto, text=True, timeout=300, check=True, capture_output=True)
+                subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-i", str(wav), "-c:a", "libopus", "-b:a", "32k",
+                                str(ogg)], timeout=120, check=True)
+            except Exception as e:  # noqa: BLE001
+                log("tts:", e)
+                self.texto("⚠️ No pude generar el audio de esa respuesta.")
+                return
+            if gen != self.gen_audio:
+                return  # -stop
+            self.ultimo_audio = ogg.read_bytes()
+        self._mandar_audio()
+
+    def _mandar_audio(self):
+        try:
+            self.t.api("sendVoice", espera=120, archivos={"voice": ("respuesta.ogg", self.ultimo_audio)}, chat_id=self.chat)
+        except Exception as e:  # noqa: BLE001
+            log("no pude mandar el audio:", e)
+
+    def voces(self):
+        if not self.cfg["tts_voces"]:
+            return []
+        try:
+            r = subprocess.run(self.cfg["tts_voces"], capture_output=True, text=True, timeout=20)
+            return [ln.split("\t", 1) + [""] for ln in r.stdout.splitlines() if ln.strip()]
+        except Exception:  # noqa: BLE001
+            return []
+
+    def orden_tts(self, args):
+        a = (args[0] if args else "").lower()
+        if not self.cfg["tts_comando"]:
+            return self.texto("La voz no está configurada: completá `tts_comando` en "
+                              f"`{CONFIG}` (mirá el README).")
+        if a == "on":
+            self.estado["tts"] = True
+            self.guardar_estado()
+            if self.cfg["tts_prender"]:
+                subprocess.Popen(self.cfg["tts_prender"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return self.texto("🔊 Voz prendida: cada respuesta te llega también en audio.")
+        if a == "off":
+            self.estado["tts"] = False
+            self.guardar_estado()
+            self.gen_audio += 1
+            if self.cfg["tts_apagar"]:
+                subprocess.Popen(self.cfg["tts_apagar"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return self.texto("🔇 Voz apagada.")
+        if a == "-r":
+            return self._mandar_audio() if self.ultimo_audio else self.texto("Todavía no te mandé ningún audio.")
+        if a == "-stop":
+            self.gen_audio += 1
+            return self.texto("⏹ Corto el audio de esta respuesta.")
+        if a == "voces":
+            lista = self.voces()
+            if not lista:
+                return self.texto("No encontré voces (`tts_voces` en la config).")
+            if len(args) > 1:
+                return self.elegir_voz(args[1])
+            botones = [[{"text": f"{n} · {d}" if d else n, "callback_data": f"voz:{n}"[:64]}] for n, d, *_ in lista]
+            return self.texto("Elegí una voz:", botones)
+        if a in ("-h", "ayuda"):
+            return self.texto(AYUDA_TTS)
+        prendida = "prendida 🔊" if self.estado["tts"] else "apagada 🔇"
+        self.texto(f"La voz está {prendida}. `/tts on`, `/tts off`, `/tts voces`, `/tts -r` (repetir), `/tts -stop`.")
+
+    def elegir_voz(self, voz):
+        if not self.cfg["tts_elegir"]:
+            return self.texto("No se puede cambiar la voz (`tts_elegir` en la config).")
+        r = subprocess.run([a.replace("{voz}", voz) for a in self.cfg["tts_elegir"]], capture_output=True, text=True)
+        if r.returncode:
+            return self.texto(f"⚠️ {r.stderr.strip() or 'no pude cambiar la voz'}", plano=True)
+        self.texto(f"🎙 Voz: {r.stdout.strip() or voz}")
+        if self.estado["tts"]:
+            threading.Thread(target=self._audio, args=(f"Hola, soy {voz}. Desde ahora te contesto yo.", self.gen_audio),
+                             daemon=True).start()
+
+    # -- entrada
+    def atender(self, upd):
+        if "callback_query" in upd:
+            return self.boton(upd["callback_query"])
+        msg = upd.get("message")
+        if not msg:
+            return
+        if msg.get("from", {}).get("id") != self.chat or msg.get("chat", {}).get("id") != self.chat:
+            log("ignoro un mensaje de otra cuenta")
+            return
+        self.actividad()
+        texto = msg.get("text") or ""
+        if texto.startswith("/"):
+            cmd, *args = texto[1:].split()
+            cmd = cmd.split("@")[0].lower()
+            if self.comando(cmd, args, texto):
+                return
+        try:
+            contenido = self.contenido(msg)
+        except Exception as e:  # noqa: BLE001
+            return self.texto(f"⚠️ No pude bajar lo que mandaste: {e}", plano=True)
+        if not contenido:
+            return
+        if not self.sesion.viva():
+            self.texto("🟢 Arranco una conversación nueva con Claude…")
+        self.t.api("sendChatAction", chat_id=self.chat, action="typing")
+        try:
+            self.sesion.mandar(contenido)
+        except Exception as e:  # noqa: BLE001
+            self.texto(f"⚠️ No pude hablar con Claude: {e}", plano=True)
+
+    def actividad(self):
+        self.ultimo = time.time()
+        if self.pregunta:
+            self.editar(self.pregunta[0], "👍 Seguimos.")
+            self.pregunta = None
+
+    def guardar_recibido(self, file_id, nombre=None):
+        camino, datos = self.t.bajar(file_id)
+        carpeta = ruta(self.cfg["recibidos"])
+        carpeta.mkdir(parents=True, exist_ok=True)
+        nombre = Path(nombre or Path(camino).name).name
+        destino = carpeta / nombre
+        if destino.exists():
+            destino = carpeta / f"{destino.stem}-{time.strftime('%Y%m%d-%H%M%S')}{destino.suffix}"
+        destino.write_bytes(datos)
+        return destino, datos
+
+    def contenido(self, msg):
+        texto = msg.get("text") or msg.get("caption") or ""
+        if msg.get("photo"):
+            destino, datos = self.guardar_recibido(msg["photo"][-1]["file_id"])
+            tipo = mimetypes.guess_type(destino.name)[0] or "image/jpeg"
+            return [{"type": "image", "source": {"type": "base64", "media_type": tipo,
+                                                 "data": base64.b64encode(datos).decode()}},
+                    {"type": "text", "text": f"{texto}\n\n(Te mandé esta foto; quedó guardada en {destino})".strip()}]
+        if msg.get("voice") or msg.get("audio") or msg.get("video_note"):
+            nota = msg.get("voice") or msg.get("audio") or msg.get("video_note")
+            destino, _ = self.guardar_recibido(nota["file_id"], nota.get("file_name"))
+            dicho = self.transcribir(destino)
+            if dicho:
+                destino.unlink(missing_ok=True)
+                self.texto(f"🎤 _{dicho}_")
+                return f"{texto}\n{dicho}".strip()
+            return f"{texto}\n\n(Te mandé un audio, quedó en {destino}; no lo pude pasar a texto.)".strip()
+        for clave in ("document", "video", "animation"):
+            if msg.get(clave):
+                adj = msg[clave]
+                destino, _ = self.guardar_recibido(adj["file_id"], adj.get("file_name"))
+                return f"{texto}\n\n(Te mandé el archivo {destino})".strip()
+        if msg.get("location"):
+            loc = msg["location"]
+            return f"{texto}\n\n(Te mandé mi ubicación: {loc['latitude']}, {loc['longitude']})".strip()
+        return texto
+
+    def transcribir(self, archivo):
+        if not self.cfg["transcribir"]:
+            return ""
+        self.t.api("sendChatAction", chat_id=self.chat, action="typing")
+        cmd = [a.replace("{entrada}", str(archivo)) for a in self.cfg["transcribir"]]
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=300, cwd=AQUI)
+            return r.stdout.strip()
+        except Exception as e:  # noqa: BLE001
+            log("transcribir:", e)
+            return ""
+
+    def comando(self, cmd, args, texto):
+        """True si era un comando del bot; si no, va a Claude tal cual (skills, /compact, etc.)."""
+        if cmd in ("start", "ayuda", "help"):
+            self.texto(AYUDA)
+        elif cmd == "estado":
+            s = self.sesion
+            sesion = ("trabajando ⏳" if s.ocupado else "activa 🟢") if s.viva() else "apagada ⚪ (se prende con tu próximo mensaje)"
+            quieto = int((time.time() - self.ultimo) // 60)
+            self.texto(f"**Conversación:** {sesion}\n**Sin charla hace:** {quieto} min "
+                       f"(pregunto a los {self.cfg['inactividad_min']})\n"
+                       f"**Voz:** {'on' if self.estado['tts'] else 'off'}\n**Detalle:** {'on' if self.estado['detalle'] else 'off'}\n"
+                       f"**Carpeta:** `{ruta(self.cfg['carpeta'])}`")
+        elif cmd == "parar":
+            self.texto("⏹ Corto." if self.sesion.interrumpir() else "No hay nada andando.")
+        elif cmd == "nueva":
+            self.sesion.cerrar()
+            self._sacar_estado()
+            self.texto("🆕 Listo: lo próximo que escribas arranca una conversación nueva.")
+        elif cmd == "retomar":
+            ultima = self.estado.get("ultima_sesion")
+            if not ultima:
+                self.texto("No tengo ninguna conversación anterior guardada.")
+            else:
+                self.sesion.cerrar()
+                self.sesion.arrancar(retomar=ultima)
+                self.texto("↩️ Retomé la última conversación. Seguí escribiendo.")
+        elif cmd == "terminar":
+            self.terminar("Terminé la conversación.")
+        elif cmd == "tts":
+            self.orden_tts(args)
+        elif cmd == "detalle":
+            self.estado["detalle"] = (args[:1] or ["on"])[0].lower() != "off"
+            self.guardar_estado()
+            self.texto("Te muestro cada herramienta que usa." if self.estado["detalle"] else "Solo te muestro las respuestas.")
+        elif cmd == "skills":
+            if not self.skills:
+                self.texto("Todavía no sé cuáles hay: mandame cualquier cosa para arrancar la sesión y volvé a pedirlo.")
+            else:
+                self.texto("Escribí `/nombre` y lo que quieras pasarle:\n" + "\n".join(f"• `/{s}`" for s in self.skills))
+        elif cmd == "archivo":
+            if not args:
+                self.texto("Decime la ruta: `/archivo ~/Documents/algo.pdf`")
+            else:
+                try:
+                    mandar_archivo(self.t, self.chat, texto.split(None, 1)[1].strip())
+                except Exception as e:  # noqa: BLE001
+                    self.texto(f"⚠️ {e}", plano=True)
+        elif cmd == "apagar":
+            self.texto("¿Apago el bot? No vas a poder prenderlo desde acá: hay que hacerlo en la PC "
+                       "(botón **Telegram** de Acciones rápidas o `claude-telegram on`).",
+                       [[{"text": "Sí, apagar", "callback_data": "apagar"}, {"text": "No", "callback_data": "noapagar"}]])
+        else:
+            return False
+        return True
+
+    def boton(self, q):
+        if q.get("from", {}).get("id") != self.chat:
+            return
+        dato = q.get("data", "")
+        if dato.startswith("root:"):
+            return  # lo atiende tg-root (como root), no el bot
+        try:
+            self.t.api("answerCallbackQuery", callback_query_id=q["id"])
+        except Exception:  # noqa: BLE001
+            pass
+        msg_id = q.get("message", {}).get("message_id")
+        if dato == "seguir":
+            self.actividad()
+        elif dato == "cortar":
+            self.pregunta = None
+            self.terminar("Terminé la conversación.", msg_id)
+        elif dato.startswith("voz:"):
+            self.elegir_voz(dato[4:])
+        elif dato == "apagar":
+            self.editar(msg_id, "⚫ Bot apagado. Prendelo desde la PC cuando lo necesites.")
+            self.sesion.cerrar()
+            subprocess.Popen(["systemctl", "--user", "disable", "--now", SERVICIO])
+        elif dato == "noapagar":
+            self.editar(msg_id, "👍 Sigo prendido.")
+
+    def terminar(self, motivo, msg_id=None):
+        estaba = self.sesion.viva()
+        self.sesion.cerrar()
+        self._sacar_estado()
+        if self.estado["tts"] and self.cfg["tts_apagar"]:
+            subprocess.Popen(self.cfg["tts_apagar"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        aviso = (f"⚪ {motivo} Cuando me escribas arranco otra (o /retomar para seguir esta)."
+                 if estaba else "No había ninguna conversación abierta.")
+        if msg_id:
+            self.editar(msg_id, aviso)
+        else:
+            self.texto(aviso)
+
+    # -- inactividad: 25 min sin charla -> ¿seguimos?; 3 min sin "sí" -> se apaga
+    def vigilar(self):
+        while True:
+            time.sleep(10)
+            try:
+                if not self.sesion.viva() or self.sesion.ocupado:
+                    self.pregunta = None if not self.sesion.viva() else self.pregunta
+                    continue
+                ahora = time.time()
+                if self.pregunta:
+                    if ahora - self.pregunta[1] > self.cfg["confirmar_min"] * 60:
+                        msg_id, self.pregunta = self.pregunta[0], None
+                        self.terminar("Como no contestaste, terminé la conversación.", msg_id)
+                elif ahora - self.ultimo > self.cfg["inactividad_min"] * 60:
+                    m = self.texto(f"⏰ Hace {self.cfg['inactividad_min']} minutos que no hablamos. ¿Mantengo la conversación "
+                                   f"abierta? Si no me decís que sí en {self.cfg['confirmar_min']} minutos, la cierro.",
+                                   [[{"text": "✅ Seguir", "callback_data": "seguir"},
+                                     {"text": "❌ Terminar", "callback_data": "cortar"}]])
+                    self.pregunta = (m["message_id"] if m else None, ahora)
+            except Exception as e:  # noqa: BLE001
+                log("vigilar:", e)
+
+    def escribiendo(self):
+        while True:
+            time.sleep(4.5)
+            if self.sesion.ocupado:
+                try:
+                    self.t.api("sendChatAction", chat_id=self.chat, action="typing", espera=10)
+                except Exception:  # noqa: BLE001
+                    pass
+
+    def correr(self):
+        try:
+            self.t.api("setMyCommands", commands=[{"command": c, "description": d} for c, d in COMANDOS])
+        except Exception as e:  # noqa: BLE001
+            log("setMyCommands:", e)
+        threading.Thread(target=self.vigilar, daemon=True).start()
+        threading.Thread(target=self.escribiendo, daemon=True).start()
+        offset, espera = None, 1
+        log("bot listo")
+        while True:
+            if pausado():
+                time.sleep(1)
+                continue
+            try:
+                updates = self.t.api("getUpdates", espera=40, offset=offset, timeout=25,
+                                     allowed_updates=["message", "callback_query"])
+                espera = 1
+            except ErrorTelegram as e:
+                if e.codigo == 409:  # otro getUpdates (tg-root esperando tu botón)
+                    time.sleep(1)
+                    continue
+                log("telegram:", e)
+                time.sleep(espera)
+                espera = min(espera * 2, 60)
+                continue
+            except Exception as e:  # noqa: BLE001  sin internet: reintenta solo
+                log("sin conexión:", e)
+                time.sleep(espera)
+                espera = min(espera * 2, 60)
+                continue
+            for u in updates:
+                offset = u["update_id"] + 1
+                if pausado() and "callback_query" in u and u["callback_query"].get("data", "").startswith("root:"):
+                    continue
+                try:
+                    self.atender(u)
+                except Exception as e:  # noqa: BLE001
+                    log("error atendiendo:", repr(e))
+
+
+def pausado():
+    try:
+        pid = int(PAUSA.read_text().strip())
+        os.kill(pid, 0)
+        return True
+    except PermissionError:  # el proceso de root sigue vivo
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+AYUDA = """**Claude Code por Telegram** 🤖
+Escribime como en la terminal: tengo acceso a tu PC.
+
+• Mandame **fotos, archivos o notas de voz**: quedan en la PC y se los paso a Claude.
+• Pedime archivos: "mandame el pdf de…" o `/archivo RUTA`.
+• Los **skills** y comandos de Claude andan igual: `/nombre-del-skill …` (lista con /skills).
+• Si algo necesita **root**, te llega un botón para autorizarlo.
+• Si no hablamos por 25 min te pregunto si sigo; sin respuesta en 3 min cierro la conversación. Tu próximo mensaje arranca otra.
+
+/parar · /nueva · /retomar · /terminar · /estado
+/tts on | off | voces | -r | -stop · /detalle on | off · /apagar"""
+
+AYUDA_TTS = """**Voz** 🔊
+`/tts on`: cada respuesta te llega también como nota de voz
+`/tts off`: solo texto
+`/tts voces`: elegir la voz
+`/tts -r`: repetir el último audio
+`/tts -stop`: no mandar el audio de la respuesta en curso"""
+
+
+# --- CLI ----------------------------------------------------------------------
+
+def systemctl(*a):
+    return subprocess.run(["systemctl", "--user", *a]).returncode
+
+
+def vincular(cfg):
+    t = Bot(cfg["token"])
+    yo = t.api("getMe")
+    activo = systemctl("-q", "is-active", SERVICIO) == 0
+    if activo:
+        systemctl("stop", SERVICIO)  # dos lectores de getUpdates se pisan
+    codigo = f"{random.SystemRandom().randrange(10**6):06d}"
+    enlace = f"https://t.me/{yo['username']}?start={codigo}"
+    print(f"\nÚltimo paso: conectá tu cuenta de Telegram con el bot @{yo['username']}.\n")
+    print(f"  • Desde el celular, abrí este enlace (o escaneá el QR) y tocá INICIAR:\n    {enlace}")
+    if shutil.which("qrencode"):
+        subprocess.run(["qrencode", "-t", "ANSIUTF8", "-m", "1", enlace])
+    print(f"  • O buscá @{yo['username']} en Telegram y mandale:  /start {codigo}\n")
+    print("Esperando… (Ctrl+C para cancelar)")
+    offset, limite = None, time.time() + 600
+    try:
+        while time.time() < limite:
+            for u in t.api("getUpdates", espera=40, offset=offset, timeout=25, allowed_updates=["message"]):
+                offset = u["update_id"] + 1
+                m = u.get("message") or {}
+                if m.get("chat", {}).get("type") != "private" or codigo not in (m.get("text") or ""):
+                    continue
+                de = m["from"]
+                cfg["dueno"], cfg["nombre"] = de["id"], de.get("first_name", "")
+                guardar_config(cfg)
+                t.api("getUpdates", offset=offset, timeout=0)  # confirmar lo leído
+                t.api("sendMessage", chat_id=de["id"], parse_mode="HTML",
+                      text=f"✅ ¡Listo, {html.escape(de.get('first_name', ''))}! Quedaste vinculado: "
+                           "este bot ahora solo te contesta a vos.")
+                print(f"\n✅ Vinculado con {de.get('first_name', '')} (@{de.get('username', '-')}, id {de['id']}).")
+                return True
+        print("Se venció el código (10 min). Volvé a correr: claude-telegram vincular")
+        return False
+    finally:
+        if activo:
+            systemctl("start", SERVICIO)
+
+
+def configurar():
+    import getpass
+    cfg = cargar_config()
+    print("Configuración de claude-telegram\n")
+    if cfg["token"]:
+        print(f"Ya hay un token guardado en {CONFIG}. Enter para dejarlo, o pegá uno nuevo.")
+    while True:
+        token = getpass.getpass("Token del bot (el que te dio @BotFather, no se muestra): ").strip() or cfg["token"]
+        try:
+            yo = Bot(token).api("getMe")
+            break
+        except Exception as e:  # noqa: BLE001
+            print(f"  Ese token no anda ({e}). Probá de nuevo.")
+    cfg["token"] = token
+    print(f"  ✔ Bot: @{yo['username']} ({yo['first_name']})")
+    # la voz del repo herramientas (Loquendo) y el transcriptor de voz-jorge, si están instalados
+    if not cfg["tts_comando"] and shutil.which("tts-claude"):
+        cfg.update(tts_comando=["tts-claude", "archivo", "{salida}"], tts_voces=["tts-claude", "voces"],
+                   tts_elegir=["tts-claude", "voz", "{voz}"], tts_prender=["tts-claude", "on", "telegram"],
+                   tts_apagar=["tts-claude", "off", "telegram"])
+        print("  ✔ Voz: tts-claude (Loquendo)")
+    if not cfg["transcribir"]:
+        for py in (Path.home() / "Proyectos/voz-jorge/.venv/bin/python", Path(sys.executable)):
+            if py.exists() and subprocess.run([str(py), "-c", "import faster_whisper"], capture_output=True).returncode == 0:
+                cfg["transcribir"] = [str(py), str(AQUI / "transcribir.py"), "{entrada}"]
+                print(f"  ✔ Notas de voz: faster-whisper ({py})")
+                break
+    guardar_config(cfg)
+    try:
+        t = Bot(token)
+        t.api("setMyCommands", commands=[{"command": c, "description": d} for c, d in COMANDOS])
+        t.api("setMyDescription", description="Bot privado: puente a Claude Code en una PC. Solo le contesta a su dueño.")
+    except Exception:  # noqa: BLE001
+        pass
+    if not vincular(cfg):
+        return
+    if input("\n¿Prendo el bot ahora y en cada inicio de sesión? [S/n] ").strip().lower() in ("", "s", "si", "sí", "y"):
+        systemctl("enable", "--now", SERVICIO)
+        print("🟢 Bot prendido. Escribile desde Telegram.")
+    print("\nPara root (botón de autorización): sudo ./instalar-root.sh  (ver README)")
+
+
+def main():
+    args = sys.argv[1:]
+    cmd = args[0] if args else "estado"
+    if cmd == "servir":
+        cfg = cargar_config()
+        if not cfg["token"] or not cfg["dueno"]:
+            log("falta configurar: claude-telegram configurar")
+            time.sleep(30)
+            sys.exit(1)
+        return BotClaude(cfg).correr()
+    if cmd == "configurar":
+        return configurar()
+    if cmd == "vincular":
+        cfg = cargar_config()
+        if not cfg["token"]:
+            sys.exit("Primero: claude-telegram configurar")
+        return vincular(cfg)
+    if cmd == "enviar":
+        cfg = cargar_config()
+        texto, rutas, resto = None, [], args[1:]
+        while resto:
+            a = resto.pop(0)
+            if a in ("-m", "--mensaje") and resto:
+                texto = resto.pop(0)
+            else:
+                rutas.append(a)
+        if not rutas:
+            sys.exit("uso: claude-telegram enviar RUTA [RUTA...] [-m texto]")
+        bot, fallo = Bot(cfg["token"]), False
+        for n, p in enumerate(rutas):
+            try:
+                mandar_archivo(bot, cfg["dueno"], p, texto if n == 0 else None)
+                print("enviado:", p)
+            except Exception as e:  # noqa: BLE001
+                print(f"no pude mandar {p}: {e}", file=sys.stderr)
+                fallo = True
+        sys.exit(1 if fallo else 0)
+    if cmd == "on":
+        sys.exit(systemctl("enable", "--now", SERVICIO))
+    if cmd == "off":
+        sys.exit(systemctl("disable", "--now", SERVICIO))
+    if cmd == "estado":
+        cfg = cargar_config()
+        activo = systemctl("-q", "is-active", SERVICIO) == 0
+        print(f"bot: {'prendido' if activo else 'apagado'}")
+        print(f"config: {CONFIG} ({'con token' if cfg['token'] else 'sin token'}, "
+              f"{'vinculado a ' + str(cfg['nombre'] or cfg['dueno']) if cfg['dueno'] else 'sin vincular'})")
+        return
+    sys.exit(__doc__)
+
+
+if __name__ == "__main__":
+    main()

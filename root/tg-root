@@ -1,0 +1,100 @@
+#!/usr/bin/python3 -I
+"""Corre UN comando como root solo si el dueño del bot lo autoriza con un botón en Telegram.
+
+Lo llama `tg-sudo` a través de sudo (regla NOPASSWD en /etc/sudoers.d/claude-telegram). Es root y lee
+su propia copia del token y del dueño en /etc/claude-telegram/root.json (solo root la puede leer), así
+que un proceso de usuario no puede cambiar a quién se le pregunta. El "sí" se verifica acá mismo:
+tiene que llegar de Telegram, de la cuenta del dueño, con el código al azar de este pedido.
+
+Mientras espera, deja su pid en /run/claude-telegram/pausa: el bot (usuario) deja de leer Telegram
+para no pelearse por getUpdates. No confirma updates, así el bot recibe después lo que mandaste.
+"""
+import html
+import json
+import os
+import secrets
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+CONF = Path("/etc/claude-telegram/root.json")
+PAUSA = Path("/run/claude-telegram/pausa")
+REGISTRO = Path("/var/log/claude-telegram-root.log")
+ESPERA = 300  # segundos para apretar el botón
+
+
+def api(token, metodo, espera=30, **params):
+    req = urllib.request.Request(f"https://api.telegram.org/bot{token}/{metodo}", data=json.dumps(params).encode(),
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=espera) as r:
+            return json.load(r).get("result")
+    except urllib.error.HTTPError as e:
+        if e.code == 409:  # el getUpdates del bot: el nuestro lo corta
+            return []
+        raise
+
+
+def registrar(txt):
+    with REGISTRO.open("a") as f:
+        f.write(f"{time.strftime('%F %T')} {txt}\n")
+    os.chmod(REGISTRO, 0o600)
+
+
+def main():
+    if len(sys.argv) < 2 or os.geteuid() != 0:
+        sys.exit("uso: tg-sudo 'comando'   (necesita la regla de sudo de instalar-root.sh)")
+    comando = " ".join(sys.argv[1:])
+    conf = json.loads(CONF.read_text())
+    token, dueno = conf["token"], int(conf["dueno"])
+    quien = os.environ.get("SUDO_USER", "?")
+    nonce = secrets.token_urlsafe(12)
+    PAUSA.parent.mkdir(mode=0o755, exist_ok=True)
+    PAUSA.write_text(str(os.getpid()))
+    os.chmod(PAUSA, 0o644)
+    decision = None
+    try:
+        api(token, "getUpdates", timeout=0, limit=1)  # corta el getUpdates en curso del bot
+        cwd = os.getcwd()
+        msg = api(token, "sendMessage", chat_id=dueno, parse_mode="HTML",
+                  text=f"🔐 <b>Permiso de root</b>\nClaude ({html.escape(quien)}, en <code>{html.escape(cwd)}</code>) quiere correr:"
+                       f"\n<pre>{html.escape(comando[:3500])}</pre>\nVence en {ESPERA // 60} minutos.",
+                  reply_markup={"inline_keyboard": [[{"text": "✅ Autorizar", "callback_data": f"root:{nonce}:si"},
+                                                     {"text": "❌ Rechazar", "callback_data": f"root:{nonce}:no"}]]})
+        limite = time.time() + ESPERA
+        while decision is None and time.time() < limite:
+            # sin offset: no confirma nada, así el bot recibe igual tus mensajes de mientras
+            for u in api(token, "getUpdates", espera=15, timeout=0, allowed_updates=["message", "callback_query"]) or []:
+                q = u.get("callback_query") or {}
+                if q.get("from", {}).get("id") == dueno and q.get("data", "").startswith(f"root:{nonce}:"):
+                    decision = q["data"].rsplit(":", 1)[1] == "si"
+                    try:
+                        api(token, "answerCallbackQuery", callback_query_id=q["id"],
+                            text="Autorizado" if decision else "Rechazado")
+                    except Exception:  # noqa: BLE001
+                        pass
+            if decision is None:
+                time.sleep(1)
+        if decision is None:
+            estado = "⌛ <b>Venció</b> sin respuesta"
+        else:
+            estado = "✅ <b>Autorizado</b>" if decision else "❌ <b>Rechazado</b>"
+        try:
+            api(token, "editMessageText", chat_id=dueno, message_id=msg["message_id"], parse_mode="HTML",
+                text=f"🔐 Root: {estado}\n<pre>{html.escape(comando[:3500])}</pre>")
+        except Exception:  # noqa: BLE001
+            pass
+    finally:
+        PAUSA.unlink(missing_ok=True)
+    registrar(f"{quien} {'si' if decision else 'vencio' if decision is None else 'no'}: {comando}")
+    if not decision:
+        print("tg-sudo: " + ("rechazado por el usuario" if decision is False else "no contestó a tiempo"), file=sys.stderr)
+        sys.exit(126)
+    sys.exit(subprocess.run(["/bin/bash", "-c", comando]).returncode)
+
+
+if __name__ == "__main__":
+    main()

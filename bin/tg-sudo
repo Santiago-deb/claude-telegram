@@ -1,0 +1,8 @@
+#!/bin/sh
+# Corre un comando como root después de que lo autorices con un botón en Telegram.
+#   tg-sudo 'pacman -Syu --noconfirm'
+if [ ! -x /usr/local/lib/claude-telegram/tg-root ]; then
+  echo "tg-sudo: falta instalar la parte de root: sudo ./instalar-root.sh (en la carpeta de claude-telegram)" >&2
+  exit 127
+fi
+exec sudo -n /usr/local/lib/claude-telegram/tg-root "$*"

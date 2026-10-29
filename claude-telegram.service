@@ -1,0 +1,16 @@
+[Unit]
+Description=Claude Code por Telegram (bot privado)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+WorkingDirectory=@DIR@
+Environment=PATH=@DIR@:@DIR@/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 -u @DIR@/claude-telegram servir
+Restart=always
+RestartSec=10
+TimeoutStopSec=10
+KillMode=mixed
+
+[Install]
+WantedBy=default.target
