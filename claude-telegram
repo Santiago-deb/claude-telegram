@@ -4,6 +4,7 @@
   claude-telegram configurar      asistente: token del bot, vincular tu cuenta y prender el servicio
   claude-telegram vincular        solo el último paso: vincular tu cuenta de Telegram (código o QR)
   claude-telegram enviar RUTA...  manda archivos o carpetas a tu Telegram  [-m "texto"]
+                                  (.ogg/.opus van como nota de voz; solo -m "texto" manda un mensaje)
   claude-telegram on | off        prende / apaga el bot (servicio de usuario claude-telegram)
   claude-telegram estado
   claude-telegram servir          el bot en sí (lo arranca claude-telegram.service)
@@ -239,6 +240,8 @@ def mandar_archivo(bot, chat, p, texto=None):
         metodo, campo = "sendPhoto", "photo"
     elif ext in (".mp4", ".mov", ".webm"):
         metodo, campo = "sendVideo", "video"
+    elif ext in (".ogg", ".oga", ".opus"):
+        metodo, campo = "sendVoice", "voice"
     elif ext in (".mp3", ".m4a", ".flac", ".wav"):
         metodo, campo = "sendAudio", "audio"
     else:
@@ -970,9 +973,12 @@ def main():
                 texto = resto.pop(0)
             else:
                 rutas.append(a)
-        if not rutas:
-            sys.exit("uso: claude-telegram enviar RUTA [RUTA...] [-m texto]")
+        if not rutas and not texto:
+            sys.exit("uso: claude-telegram enviar RUTA [RUTA...] [-m texto]  |  enviar -m texto")
         bot, fallo = Bot(cfg["token"]), False
+        if not rutas:
+            bot.api("sendMessage", chat_id=cfg["dueno"], text=texto)
+            return print("enviado: mensaje")
         for n, p in enumerate(rutas):
             try:
                 mandar_archivo(bot, cfg["dueno"], p, texto if n == 0 else None)

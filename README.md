@@ -14,7 +14,7 @@ Un bot **privado** de Telegram conectado a una sesión de [Claude Code](https://
 | Mandar una **foto** | Se guarda en la PC y Claude la ve. |
 | Mandar un **archivo** | Se guarda en `~/Downloads/telegram` y Claude recibe la ruta. |
 | Mandar una **nota de voz** | Se pasa a texto (faster-whisper, si está instalado) y se la paso a Claude; con `/transcripcion on` también te muestra lo que entendió. |
-| "Mandame el pdf de…" | Claude te lo manda con `claude-telegram enviar`. Las carpetas van en zip (hasta 50 MB). |
+| "Mandame el pdf de…" | Claude te lo manda con `claude-telegram enviar`. Las carpetas van en zip (hasta 50 MB); los `.ogg`/`.opus` llegan como nota de voz y `enviar -m "texto"` manda solo un mensaje. |
 | `/nombre-de-skill …` | Los skills y comandos de Claude Code andan igual que en la terminal. `/skills` los lista. |
 | `/tts on` · `off` · `voces` · `-r` · `-t` · `-stop` | Respuestas solo en nota de voz, elegir voz, repetir el último audio, mandar el texto de la última respuesta, no mandar el audio de la respuesta en curso (va en texto). |
 | `/parar` | Corta lo que Claude está haciendo. |
