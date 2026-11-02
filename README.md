@@ -38,6 +38,8 @@ Si no contestás en 5 minutos, se rechaza. Cada pedido queda en `/var/log/claude
 
 Cómo está hecho, para que sea seguro: `tg-root` es un programa de root con su propia copia del token y de tu id en `/etc/claude-telegram/root.json` (solo root la lee). Él mismo manda el botón con un código al azar y él mismo lee la respuesta de Telegram: solo vale si viene de tu cuenta y con ese código. Un proceso de tu usuario no puede falsificar el "sí". La regla de sudo solo deja correr ese programa sin contraseña.
 
+Lo que ves en Telegram es exactamente lo que se ejecuta: `tg-root` rechaza solo (sin mandarte el botón) los comandos de más de 3500 caracteres, que no entrarían enteros en el mensaje, y los que tienen caracteres invisibles o de control, como espacios de ancho cero o marcas que dan vuelta el texto. Además, el "Autorizar" solo vale si viene del botón del mensaje original y si nadie editó ese mensaje (quien tenga el token del bot podría intentarlo).
+
 ## Instalación paso a paso
 
 **Requisitos:** Linux con systemd, [Claude Code](https://docs.claude.com/en/docs/claude-code) instalado y con sesión iniciada (`claude` anda en la terminal), Python 3.11+. Opcionales: `ffmpeg` (audios), `qrencode` (QR para vincular), faster-whisper (notas de voz).

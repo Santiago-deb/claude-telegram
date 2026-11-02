@@ -4,7 +4,12 @@
 Lo llama `tg-sudo` a través de sudo (regla NOPASSWD en /etc/sudoers.d/claude-telegram). Es root y lee
 su propia copia del token y del dueño en /etc/claude-telegram/root.json (solo root la puede leer), así
 que un proceso de usuario no puede cambiar a quién se le pregunta. El "sí" se verifica acá mismo:
-tiene que llegar de Telegram, de la cuenta del dueño, con el código al azar de este pedido.
+tiene que llegar de Telegram, de la cuenta del dueño, con el código al azar de este pedido, desde el
+botón del mensaje que mandó este programa y sin que nadie haya editado ese mensaje.
+
+Lo que se ve en Telegram tiene que ser exactamente lo que se ejecuta: se rechazan solos los comandos
+que no entran enteros en el mensaje y los que tienen caracteres invisibles o de control (espacios de
+ancho cero, marcas de dirección que dan vuelta el texto, retornos de carro…).
 
 Mientras espera, deja su pid en /run/claude-telegram/pausa: el bot (usuario) deja de leer Telegram
 para no pelearse por getUpdates. No confirma updates, así el bot recibe después lo que mandaste.
@@ -16,6 +21,7 @@ import secrets
 import subprocess
 import sys
 import time
+import unicodedata
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -24,6 +30,7 @@ CONF = Path("/etc/claude-telegram/root.json")
 PAUSA = Path("/run/claude-telegram/pausa")
 REGISTRO = Path("/var/log/claude-telegram-root.log")
 ESPERA = 300  # segundos para apretar el botón
+LIMITE = 3500  # caracteres que se muestran enteros en el mensaje de Telegram
 
 
 def api(token, metodo, espera=30, **params):
@@ -44,6 +51,20 @@ def registrar(txt):
     os.chmod(REGISTRO, 0o600)
 
 
+def problema(comando):
+    """Motivo por el que el comando no se puede mostrar fielmente en Telegram, o None si está bien."""
+    if not comando.strip():
+        return "está vacío"
+    if len(comando) > LIMITE:
+        return f"tiene {len(comando)} caracteres y en Telegram se muestran {LIMITE}: lo que no se viera se ejecutaría igual"
+    raros = sorted({f"U+{ord(c):04X}" for c in comando
+                    if c not in "\n\t" and (unicodedata.category(c)[0] == "C" or unicodedata.category(c) in ("Zl", "Zp")
+                                            or (unicodedata.category(c) == "Zs" and c != " "))})
+    if raros:
+        return "tiene caracteres invisibles o de control (" + ", ".join(raros[:8]) + "): lo que se ve no sería lo que se ejecuta"
+    return None
+
+
 def main():
     if len(sys.argv) < 2 or os.geteuid() != 0:
         sys.exit("uso: tg-sudo 'comando'   (necesita la regla de sudo de instalar-root.sh)")
@@ -51,17 +72,32 @@ def main():
     conf = json.loads(CONF.read_text())
     token, dueno = conf["token"], int(conf["dueno"])
     quien = os.environ.get("SUDO_USER", "?")
+
+    motivo = problema(comando)
+    if motivo:
+        registrar(f"{quien} rechazado solo ({motivo}): {comando[:4000]!r}")
+        try:
+            api(token, "sendMessage", chat_id=dueno, parse_mode="HTML",
+                text=f"🔐 <b>Pedido de root rechazado solo</b>\nClaude ({html.escape(quien)}) pidió un comando que "
+                     f"{html.escape(motivo)}. No se ejecutó nada.")
+        except Exception:  # noqa: BLE001
+            pass
+        sys.exit(f"tg-sudo: rechazado sin preguntar: el comando {motivo}. Partilo en comandos más cortos y legibles.")
+
     nonce = secrets.token_urlsafe(12)
+    lineas = comando.count("\n") + 1
     PAUSA.parent.mkdir(mode=0o755, exist_ok=True)
     PAUSA.write_text(str(os.getpid()))
     os.chmod(PAUSA, 0o644)
     decision = None
+    alterado = False
     try:
         api(token, "getUpdates", timeout=0, limit=1)  # corta el getUpdates en curso del bot
         cwd = os.getcwd()
         msg = api(token, "sendMessage", chat_id=dueno, parse_mode="HTML",
-                  text=f"🔐 <b>Permiso de root</b>\nClaude ({html.escape(quien)}, en <code>{html.escape(cwd)}</code>) quiere correr:"
-                       f"\n<pre>{html.escape(comando[:3500])}</pre>\nVence en {ESPERA // 60} minutos.",
+                  text=f"🔐 <b>Permiso de root</b>\nClaude ({html.escape(quien)}, en <code>{html.escape(cwd)}</code>) quiere correr "
+                       f"({len(comando)} caracteres, {lineas} línea{'s' if lineas != 1 else ''}):"
+                       f"\n<pre>{html.escape(comando)}</pre>\nVence en {ESPERA // 60} minutos.",
                   reply_markup={"inline_keyboard": [[{"text": "✅ Autorizar", "callback_data": f"root:{nonce}:si"},
                                                      {"text": "❌ Rechazar", "callback_data": f"root:{nonce}:no"}]]})
         limite = time.time() + ESPERA
@@ -69,29 +105,40 @@ def main():
             # sin offset: no confirma nada, así el bot recibe igual tus mensajes de mientras
             for u in api(token, "getUpdates", espera=15, timeout=0, allowed_updates=["message", "callback_query"]) or []:
                 q = u.get("callback_query") or {}
-                if q.get("from", {}).get("id") == dueno and q.get("data", "").startswith(f"root:{nonce}:"):
+                if q.get("from", {}).get("id") != dueno or not q.get("data", "").startswith(f"root:{nonce}:"):
+                    continue
+                m = q.get("message") or {}
+                # el botón tiene que ser el de NUESTRO mensaje y ese mensaje no puede haber sido editado
+                # (con el token del bot se podría cambiar el texto o copiar el botón a otro mensaje)
+                if m.get("message_id") != msg["message_id"] or (m.get("chat") or {}).get("id") != dueno or "edit_date" in m:
+                    alterado, decision = True, False
+                else:
                     decision = q["data"].rsplit(":", 1)[1] == "si"
-                    try:
-                        api(token, "answerCallbackQuery", callback_query_id=q["id"],
-                            text="Autorizado" if decision else "Rechazado")
-                    except Exception:  # noqa: BLE001
-                        pass
+                try:
+                    api(token, "answerCallbackQuery", callback_query_id=q["id"],
+                        text="Rechazado: el mensaje fue alterado" if alterado else "Autorizado" if decision else "Rechazado")
+                except Exception:  # noqa: BLE001
+                    pass
+                break
             if decision is None:
                 time.sleep(1)
         if decision is None:
             estado = "⌛ <b>Venció</b> sin respuesta"
+        elif alterado:
+            estado = "❌ <b>Rechazado</b>: el mensaje o el botón no eran los originales"
         else:
             estado = "✅ <b>Autorizado</b>" if decision else "❌ <b>Rechazado</b>"
         try:
             api(token, "editMessageText", chat_id=dueno, message_id=msg["message_id"], parse_mode="HTML",
-                text=f"🔐 Root: {estado}\n<pre>{html.escape(comando[:3500])}</pre>")
+                text=f"🔐 Root: {estado}\n<pre>{html.escape(comando)}</pre>")
         except Exception:  # noqa: BLE001
             pass
     finally:
         PAUSA.unlink(missing_ok=True)
-    registrar(f"{quien} {'si' if decision else 'vencio' if decision is None else 'no'}: {comando}")
+    registrar(f"{quien} {'si' if decision else 'vencio' if decision is None else 'alterado' if alterado else 'no'}: {comando}")
     if not decision:
-        print("tg-sudo: " + ("rechazado por el usuario" if decision is False else "no contestó a tiempo"), file=sys.stderr)
+        print("tg-sudo: " + ("rechazado: el mensaje de Telegram fue alterado" if alterado
+                             else "rechazado por el usuario" if decision is False else "no contestó a tiempo"), file=sys.stderr)
         sys.exit(126)
     sys.exit(subprocess.run(["/bin/bash", "-c", comando]).returncode)
 
