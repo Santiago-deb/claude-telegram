@@ -126,14 +126,24 @@ class Bot:
         else:
             req = urllib.request.Request(self.base + metodo, data=json.dumps(params).encode(),
                                          headers={"Content-Type": "application/json"})
-        try:
-            with urllib.request.urlopen(req, timeout=espera) as r:
-                res = json.load(r)
-        except urllib.error.HTTPError as e:
+        # Si se corta la red (WiFi que se cae, hotspot), los envíos reintentan ~2 min en vez de perderse.
+        pausas = [] if metodo == "getUpdates" else [5, 10, 20, 30, 30, 30]
+        while True:
             try:
-                res = json.load(e)
-            except Exception:  # noqa: BLE001
-                raise ErrorTelegram(e.code, e.reason) from None
+                with urllib.request.urlopen(req, timeout=espera) as r:
+                    res = json.load(r)
+                break
+            except urllib.error.HTTPError as e:
+                try:
+                    res = json.load(e)
+                except Exception:  # noqa: BLE001
+                    raise ErrorTelegram(e.code, e.reason) from None
+                break
+            except (urllib.error.URLError, TimeoutError, OSError) as e:
+                if not pausas:
+                    raise
+                log(f"{metodo}: sin red ({e}), reintento")
+                time.sleep(pausas.pop(0))
         if not res.get("ok"):
             raise ErrorTelegram(res.get("error_code"), res.get("description"))
         return res["result"]
@@ -503,13 +513,17 @@ class BotClaude:
                     self.texto(texto)
                 return
             self.ultimo_audio = ogg.read_bytes()
-        self._mandar_audio()
+        if not self._mandar_audio() and oculto:  # sin audio no te puede quedar sin respuesta
+            self.texto("⚠️ No pude mandar el audio. Va en texto:")
+            self.texto(texto)
 
     def _mandar_audio(self):
         try:
             self.t.api("sendVoice", espera=120, archivos={"voice": ("respuesta.ogg", self.ultimo_audio)}, chat_id=self.chat)
+            return True
         except Exception as e:  # noqa: BLE001
             log("no pude mandar el audio:", e)
+            return False
 
     def voces(self):
         if not self.cfg["tts_voces"]:
@@ -927,7 +941,7 @@ def configurar():
                    tts_apagar=["tts-claude", "off", "telegram"])
         print("  ✔ Voz: tts-claude (Loquendo)")
     if not cfg["transcribir"]:
-        for py in (Path.home() / "Proyectos/voz-jorge/.venv/bin/python", Path(sys.executable)):
+        for py in (Path.home() / "Proyectos/Sistema/voz-jorge/.venv/bin/python", Path(sys.executable)):
             if py.exists() and subprocess.run([str(py), "-c", "import faster_whisper"], capture_output=True).returncode == 0:
                 cfg["transcribir"] = [str(py), str(AQUI / "transcribir.py"), "{entrada}"]
                 print(f"  ✔ Notas de voz: faster-whisper ({py})")
